@@ -200,7 +200,7 @@ select.inp{-webkit-appearance:none;appearance:none;text-align:center;font-family
 'use strict';
 /* ===== 設定 ===== */
 const API = 'https://script.google.com/macros/s/AKfycbyO9KSUqwLD1rcg4puUQQRIkYBJr52Np5U8CmDv6ipuSL6JLhefoAZBXOS1xmF9bLeP/exec';
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.1';
 const SYNC_MS = 30000;
 
 /* ===== 本機儲存 ===== */
@@ -234,7 +234,7 @@ let D = store.get('data', null);            // {trip, members, categories, templ
 let outbox = store.get('outbox', []);       // 待上傳的動作
 let lastSync = store.get('lastSync', 0);
 let net = { state: 'idle', msg: '' };       // idle | syncing | offline | error
-let tab = 'home', listFilter = 'all', F = null, C = null, memDel = null, cardDel = null, rcCat = '購物', exportRes = null, busy = {};
+let tab = 'home', listFilter = 'all', F = null, C = null, memDel = null, cardDel = null, exportRes = null, busy = {};
 const saveData = () => store.set('data', D), saveOutbox = () => store.set('outbox', outbox);
 
 /* ===== 小工具 ===== */
@@ -418,20 +418,52 @@ function settle() {
   while (i < db.length && j < cr.length) { const v = Math.min(db[i].net, cr[j].net); if (v > 0) tr.push({ from: db[i].id, to: cr[j].id, v: v }); db[i].net -= v; cr[j].net -= v; if (db[i].net <= 0) i++; if (cr[j].net <= 0) j++; }
   return { bal: bal, tr: tr, shown: shown };
 }
-const fits = (c, k) => c.cats.includes('*') || c.cats.includes(k);
-function cardStat(c) {
-  let used = 0, reward = 0;
-  recs().filter(r => r.pay === 'card' && r.cardId === c.id).sort((a, b) => sortKey(a) < sortKey(b) ? -1 : 1).forEach(r => {
-    const t = toTWD(num(r.amount), r.currency), inCap = Math.max(0, Math.min(t, c.cap - used));
-    reward += inCap * (fits(c, r.cat) ? c.rate : c.base) / 100; used += t;
-  });
-  return { used: used, reward: reward, left: Math.max(0, c.cap - used), fee: used * c.fee / 100 };
+/* 卡片回饋：base＝基本回饋（無上限）；rules＝加碼規則（全部／類別／店家），rate 是含基本的總回饋，cap 是加碼可刷的台幣上限 */
+const normT = t => String(t == null ? '' : t).toLowerCase().replace(/[\s・･·\-_]/g, '');
+function ruleMatch(rule, r) {
+  if (rule.kind === 'all') return true;
+  if (rule.kind === 'cat') return rule.targets.includes(r.cat) || rule.targets.includes(r.sub) || rule.targets.includes(r.cat + '/' + r.sub);
+  const text = normT((r.item || '') + ' ' + (r.note || ''));
+  return rule.targets.some(k => { const n = normT(k); return n && text.includes(n); });
 }
-function rankCards(owner, k, amtTWD) {
-  return D.cards.filter(c => c.owner === owner).map(c => {
-    const st = cardStat(c), rate = fits(c, k) ? c.rate : c.base;
-    return { c: c, st: st, rate: rate, rew: Math.min(st.left, amtTWD) * rate / 100 - amtTWD * c.fee / 100 };
-  }).sort((a, b) => b.rew - a.rew);
+function bestRule(c, r, used) {
+  let best = null;
+  (c.rules || []).forEach(rule => {
+    if (!ruleMatch(rule, r) || rule.rate <= c.base) return;
+    const left = rule.cap == null ? Infinity : rule.cap - (used[rule.id] || 0);
+    if (left <= 0) return;
+    if (!best || rule.rate > best.rule.rate) best = { rule: rule, left: left };
+  });
+  return best;
+}
+function cardStat(c, exceptId) {
+  const used = {}; (c.rules || []).forEach(r => used[r.id] = 0);
+  let total = 0, reward = 0;
+  recs().filter(r => r.pay === 'card' && r.cardId === c.id && r.id !== exceptId).sort((a, b) => sortKey(a) < sortKey(b) ? -1 : 1).forEach(r => {
+    const t = toTWD(num(r.amount), r.currency); total += t; reward += t * c.base / 100;
+    if (r.noBonus) return;
+    const b = bestRule(c, r, used);
+    if (b) { const x = Math.min(t, b.left); used[b.rule.id] += x; reward += x * (b.rule.rate - c.base) / 100; }
+  });
+  return { used: total, reward: reward, fee: total * c.fee / 100, ruleUsed: used };
+}
+// 預估「這筆刷這張卡」的回饋。probe 是一筆記帳（類別、項目、備註）
+function quote(c, probe, amtTWD, exceptId) {
+  const st = cardStat(c, exceptId), a = amtTWD > 0 ? amtTWD : 1000;
+  const b = probe.noBonus ? null : bestRule(c, probe, st.ruleUsed);
+  let rew = a * c.base / 100;
+  if (b) rew += Math.min(a, b.left) * (b.rule.rate - c.base) / 100;
+  const capped = probe.noBonus ? [] : (c.rules || []).filter(rule => rule.rate > c.base && rule.cap != null && ruleMatch(rule, probe) && rule.cap - (st.ruleUsed[rule.id] || 0) <= 0).map(x => x.name);
+  const net = rew - a * c.fee / 100;
+  return { c: c, rule: b && b.rule, left: b ? b.left : null, rate: rew / a * 100, net: net, netRate: net / a * 100, capped: capped };
+}
+function rankCards(owners, probe, amtTWD, exceptId) {
+  return D.cards.filter(c => owners.includes(c.owner)).map(c => quote(c, probe, amtTWD, exceptId)).sort((x, y) => y.net - x.net);
+}
+const pct = n => (Math.round(n * 10) / 10) + '%';
+function quoteLine(q, showOwner) {
+  const why = q.rule ? `${esc(q.rule.name)} ${q.rule.rate}%${q.left !== Infinity && q.left != null ? `・加碼剩 ${fmt(q.left, 'TWD')}` : ''}` : `基本 ${q.c.base}%${q.capped.length ? `（${esc(q.capped.join('、'))} 額度已滿）` : ''}`;
+  return `<span><b>${esc(q.c.name)}</b>${showOwner ? `<span class="rs">・${esc(member(q.c.owner).name)}</span>` : ''}<br><span class="rs">${why}</span>${q.rule && q.rule.note ? `<br><span class="rs">⚠ ${esc(q.rule.note)}</span>` : ''}</span>`;
 }
 
 /* ===== 畫面 ===== */
@@ -500,33 +532,45 @@ function vSettle() {
   </tbody></table><div class="note">差額為正代表別人要還他；台幣紀錄依全域匯率換算。</div></section>`;
 }
 
+const SHOP_CHIPS = ['Suica儲值', 'JR', '租車', '唐吉訶德', 'Bic Camera', 'UNIQLO', '松本清', '7-11', '全家', 'Lawson', '一蘭', '壽司郎', '迪士尼', 'AEON', '高島屋'];
+let shop = { text: '', cat: '', who: 'all', amt: '10000' };
 function vCards() {
   const owners = D.members.filter(m => m.admin);
   const catsAll = D.categories.filter(c => c.cat !== '未分類');
-  if (!catsAll.find(c => c.cat === rcCat) && catsAll[0]) rcCat = catsAll[0].cat;
-  return owners.map(o => {
+  const ruleText = r => r.kind === 'all' ? '全部消費' : r.kind === 'cat' ? r.targets.join('、') : (r.targets.slice(0, 6).join('、') + (r.targets.length > 6 ? ` 等 ${r.targets.length} 家` : ''));
+  const lookup = `<section class="panel"><h2 class="h" style="margin:0">這家店刷哪張？</h2>
+  <input class="inp" id="shopText" placeholder="輸入店家，例如 唐吉訶德、一蘭、Suica" value="${esc(shop.text)}" autocomplete="off">
+  <div class="chips">${SHOP_CHIPS.map(s => `<button class="chip sm ${shop.text === s ? 'on' : ''}" data-act="shop-pick" data-v="${esc(s)}">${esc(s)}</button>`).join('')}</div>
+  <div class="note">不知道店名時，也可以只選類別：</div>
+  <div class="chips">${catsAll.map(c => `<button class="chip sm ${shop.cat === c.cat ? 'on' : ''}" data-act="shop-cat" data-v="${esc(c.cat)}">${c.icon} ${esc(c.cat)}</button>`).join('')}</div>
+  <div class="row2"><div class="field"><label for="shopAmt" class="note">金額（${esc(D.trip.currency)}）</label><input class="inp num" id="shopAmt" type="text" inputmode="numeric" pattern="[0-9]*" value="${esc(shop.amt)}"></div>
+  <div class="field"><span class="note">誰的卡</span><div class="chips">${[{ id: 'all', name: '全部' }].concat(owners).map(m => `<button class="chip sm ${shop.who === m.id ? 'on' : ''}" data-act="shop-who" data-v="${m.id}">${esc(m.name)}</button>`).join('')}</div></div></div>
+  <div id="shopOut"></div></section>`;
+  const list = owners.map(o => {
     const cs = D.cards.filter(c => c.owner === o.id);
-    return `<section><div class="h-row"><div class="owner">${esc(o.name)} 的卡片</div><button class="link" data-act="card-new" data-v="${o.id}">＋ 新增卡片</button></div>
-    ${cs.map(c => { const s = cardStat(c), p = c.cap ? Math.min(100, s.used / c.cap * 100) : 0;
+    return `<section><div class="h-row"><div class="owner">${esc(o.name)} 的卡片（${cs.length}）</div><button class="link" data-act="card-new" data-v="${o.id}">＋ 新增</button></div>
+    ${cs.map(c => { const s = cardStat(c);
       return `<div class="panel" style="margin-top:8px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline"><b>${esc(c.name)}</b><button class="link" data-act="card-edit" data-v="${c.id}">編輯</button></div>
-      <div class="rs">${c.cats.includes('*') ? '全類別' : esc(c.cats.join('、'))} ${c.rate}%・其他 ${c.base}%・海外手續費 ${c.fee}%</div>
-      <div class="bar ${p >= 85 ? 'hot' : ''}"><i style="width:${p}%"></i></div>
-      <div class="kv"><span>已刷 <b class="num">${fmt(s.used, 'TWD')}</b> / 上限 <span class="num">${fmt(c.cap, 'TWD')}</span></span><span>剩 <b class="num">${fmt(s.left, 'TWD')}</b></span></div>
-      <div class="kv"><span>預估回饋 <b class="num">${fmt(s.reward, 'TWD')}</b></span><span>手續費約 <span class="num">${fmt(s.fee, 'TWD')}</span></span></div>
-      ${p >= 85 ? '<div class="alert" style="font-size:13px">快到回饋上限了</div>' : ''}</div>`; }).join('') || '<div class="panel" style="margin-top:8px"><div class="note">還沒有卡片</div></div>'}</section>`;
-  }).join('') +
-  `<section class="panel"><h2 class="h" style="margin:0">這筆該刷哪張卡？</h2>
-  <div class="chips" id="rcCats">${catsAll.map(c => `<button class="chip sm ${c.cat === rcCat ? 'on' : ''}" data-act="rc-cat" data-v="${esc(c.cat)}">${c.icon} ${esc(c.cat)}</button>`).join('')}</div>
-  <input class="inp num" id="rcAmt" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="金額（${esc(D.trip.currency)}）" value="10000">
-  <div id="rcOut"></div></section>
-  <div class="note">回饋與上限依全域匯率換算台幣，是預估值；實際以銀行入帳金額與帳單週期為準。</div>`;
+      <div class="kv"><span>基本 ${c.base}%・手續費 ${c.fee}%</span><span>已刷 <b class="num">${fmt(s.used, 'TWD')}</b>・回饋約 <b class="num">${fmt(s.reward, 'TWD')}</b></span></div>
+      ${(c.rules || []).map(r => { const u = s.ruleUsed[r.id] || 0, p = r.cap ? Math.min(100, u / r.cap * 100) : 0;
+        return `<div style="display:flex;flex-direction:column;gap:4px;padding-top:6px;border-top:1px dotted var(--line)"><div class="kv"><span><b>${esc(r.name)} ${r.rate}%</b></span><span>${r.cap != null ? `剩 <b class="num">${fmt(Math.max(0, r.cap - u), 'TWD')}</b> / ${fmt(r.cap, 'TWD')}` : '無上限'}</span></div>
+        ${r.cap != null ? `<div class="bar ${p >= 85 ? 'hot' : ''}"><i style="width:${p}%"></i></div>` : ''}<div class="rs">${esc(ruleText(r))}</div>${r.note ? `<div class="rs">⚠ ${esc(r.note)}</div>` : ''}</div>`; }).join('')}
+      ${c.note ? `<div class="rs">${esc(c.note)}</div>` : ''}</div>`; }).join('') || '<div class="panel" style="margin-top:8px"><div class="note">還沒有卡片</div></div>'}</section>`;
+  }).join('');
+  return lookup + `<div class="row2"><button class="btn ghost" data-act="preset-open">匯入建議卡片（${esc(PRESET.version)}）</button></div>` + list +
+    '<div class="note">回饋依全域匯率換算台幣，是預估值；實際以銀行入帳金額、登錄狀態與帳單週期為準。</div>';
 }
-function updRc() {
-  const out = $('#rcOut'); if (!out) return;
-  const who = isAdmin(auth.me) ? auth.me : (D.members.find(m => m.admin) || {}).id;
-  const a = toTWD(num($('#rcAmt').value), D.trip.currency), rk = rankCards(who, rcCat, a);
-  out.innerHTML = rk.length ? rk.map((x, i) => `<div class="kv" style="padding:6px 0;border-bottom:1px dotted var(--line)"><span>${i === 0 ? '<b style="color:var(--good)">推薦</b> ' : ''}${esc(x.c.name)}・${x.rate}%</span><span class="num">淨回饋 ${fmt(x.rew, 'TWD')}</span></div>`).join('') +
-    `<div class="note" style="margin-top:6px">淨回饋＝額度內回饋－海外手續費，以 ${esc(member(who).name)} 的卡計算</div>` : '<div class="note">先新增卡片才能推薦</div>';
+function updShop() {
+  const out = $('#shopOut'); if (!out) return;
+  document.querySelectorAll('[data-act=shop-pick]').forEach(x => x.classList.toggle('on', x.dataset.v === shop.text));
+  if (!shop.text.trim() && !shop.cat) { out.innerHTML = '<div class="note">輸入店家或選一個類別，就會列出最划算的卡</div>'; return; }
+  const owners = shop.who === 'all' ? D.members.filter(m => m.admin).map(m => m.id) : [shop.who];
+  const probe = { cat: shop.cat, sub: '', item: shop.text, note: '' };
+  const rk = rankCards(owners, probe, toTWD(num(shop.amt), D.trip.currency));
+  out.innerHTML = rk.length ? rk.slice(0, 8).map((q, i) => `<div class="kv" style="padding:8px 0;border-bottom:1px dotted var(--line);align-items:flex-start;flex-wrap:nowrap">
+    ${quoteLine(q, shop.who === 'all')}<span style="text-align:right;white-space:nowrap">${i === 0 ? '<b style="color:var(--good)">推薦</b><br>' : ''}<b class="num">${pct(q.netRate)}</b><br><span class="rs">扣手續費</span></span></div>`).join('')
+    + `<div class="note" style="margin-top:6px">百分比已扣海外手續費。店名比對是用關鍵字，找不到的店請改選類別。</div>`
+    : '<div class="note">還沒有卡片，可以先按「匯入建議卡片」</div>';
 }
 
 function vSettings() {
@@ -580,7 +624,7 @@ function render() {
   $('#tabsIn').innerHTML = tabs.map(([k, l]) => `<button class="${tab === k ? 'on' : ''}" data-act="tab" data-v="${k}">${l}</button>`).join('');
   const keep = document.activeElement && document.activeElement.id;
   $('#main').innerHTML = { home: vHome, list: vList, settle: vSettle, cards: vCards, settings: vSettings }[tab]();
-  if (tab === 'cards') updRc();
+  if (tab === 'cards') updShop();
   if (keep && $('#' + keep) && $('#main').contains($('#' + keep))) $('#' + keep).focus();
   renderStatus();
 }
@@ -632,7 +676,7 @@ function newForm(o) {
   const def = active().some(m => m.id === payer) ? payer : auth.me;
   const firstCat = D.categories[0] || { cat: '未分類', subs: [{ sub: '待補' }] };
   F = Object.assign({ id: null, date: today(), time: nowHM(), cat: firstCat.cat, sub: (firstCat.subs[0] || {}).sub || '', item: '', currency: D.trip.currency, amount: '', uncertain: false,
-    payer: def, pay: 'cash', cardId: '', split: 'all', some: [], custom: {}, customSel: [], note: '', photoId: '', photoData: null, ocr: false, ocrState: null, ocrInfo: null, confirmDel: false, baseRev: null }, o || {});
+    payer: def, pay: 'cash', cardId: '', split: 'all', some: [], custom: {}, customSel: [], note: '', photoId: '', photoData: null, ocr: false, ocrState: null, ocrInfo: null, confirmDel: false, baseRev: null, noBonus: false }, o || {});
   openSheet();
 }
 function openSheet() { $('#sheet').hidden = false; document.body.style.overflow = 'hidden'; renderForm(); $('#sheet').scrollTop = 0; }
@@ -663,12 +707,13 @@ function renderForm() {
   let cardRow = '';
   if (F.pay === 'card') {
     if (canPickCard()) { const cs = D.cards.filter(x => x.owner === F.payer);
-      cardRow = cs.length ? `<div class="chips">${cs.map(x => `<button class="chip sm ${F.cardId === x.id ? 'on' : ''}" data-act="f-card" data-v="${x.id}">${esc(x.name)}</button>`).join('')}<button class="chip sm ${!F.cardId ? 'on' : ''}" data-act="f-card" data-v="">不指定</button></div><div class="rec" id="rec"></div>`
+      cardRow = cs.length ? `<div class="rec" id="rec"></div><div class="chips">${cs.map(x => `<button class="chip sm ${F.cardId === x.id ? 'on' : ''}" data-act="f-card" data-v="${x.id}">${esc(x.name)}</button>`).join('')}<button class="chip sm ${!F.cardId ? 'on' : ''}" data-act="f-card" data-v="">不指定</button></div>
+        ${F.cardId ? `<div class="info" id="cardRule"></div><label class="unc plain ${F.noBonus ? 'on' : ''}" id="noBonusL" style="align-self:flex-start"><input type="checkbox" id="noBonus" ${F.noBonus ? 'checked' : ''}>這筆不適用加碼（網購、沒登錄等）</label>` : ''}`
         : '<div class="note">還沒有設定卡片，可以到「卡片」分頁新增</div>';
     } else cardRow = `<div class="note">${isAdmin(F.payer) && !unlocked() ? '卡別由持卡人自己選' : '記為「信用卡」'}</div>`;
   }
   let split = '';
-  if (F.split === 'some') split = `<div class="chips">${active().map(m => `<button class="chip ${F.some.includes(m.id) ? 'on' : ''}" data-act="f-mem" data-v="${m.id}">${esc(m.name)}</button>`).join('')}</div>`;
+  if (F.split === 'some') split = `<div class="note">點選要分攤的人，金額由他們平均分攤${F.some.length ? `（${F.some.length} 人，每人約 ${fmt(Math.floor(num(F.amount) / F.some.length), F.currency)}）` : ''}</div><div class="chips">${active().map(m => `<button class="chip ${F.some.includes(m.id) ? 'on' : ''}" data-act="f-mem" data-v="${m.id}">${esc(m.name)}</button>`).join('')}</div>`;
   if (F.split === 'custom') { const sel = active().filter(m => F.customSel.includes(m.id));
     split = `<div class="chips">${active().map(m => `<button class="chip ${F.customSel.includes(m.id) ? 'on' : ''}" data-act="f-cu" data-v="${m.id}">${esc(m.name)}</button>`).join('')}</div>
     ${sel.length ? `<div class="panel" style="padding:10px">${sel.map(m => `<div class="cust"><label for="cu_${m.id}">${esc(m.name)}</label>
@@ -694,7 +739,7 @@ function renderForm() {
    <input class="inp" id="item" placeholder="或自己輸入（留空會記為「待補」）" value="${esc(F.item)}" maxlength="100"></div>
   <div class="field"><h3 class="h" style="margin:0">誰付的</h3><div class="chips">${active().map(m => `<button class="chip ${F.payer === m.id ? 'on' : ''}" data-act="f-set" data-k="payer" data-v="${m.id}">${esc(m.name)}</button>`).join('')}</div></div>
   <div class="field"><h3 class="h" style="margin:0">付款方式</h3>${seg('pay', [['cash', '現金'], ['card', '信用卡'], ['ic', '交通卡']])}${cardRow}</div>
-  <div class="field"><h3 class="h" style="margin:0">分帳</h3>${seg('split', [['all', '全團均分'], ['some', '指定成員'], ['custom', '自訂金額'], ['none', '個人']])}${split}</div>
+  <div class="field"><h3 class="h" style="margin:0">分帳</h3>${seg('split', [['all', '全團均分'], ['some', '指定均分'], ['custom', '自訂金額'], ['none', '個人']])}${split}</div>
   <div class="dt"><div class="field"><label for="date" class="h" style="margin:0">日期</label><input class="inp" type="date" id="date" value="${esc(F.date)}"></div>
    <div class="field"><span class="h" style="margin:0">時間</span>${timeSel()}</div></div>
   <label class="unc plain ${F.time ? '' : 'on'}" id="noTimeL" style="align-self:flex-start"><input type="checkbox" id="noTime" ${F.time ? '' : 'checked'}>不記時間，只記日期</label>
@@ -725,9 +770,13 @@ function updLive() {
   const rm = $('#remain');
   if (rm) { const s = customSum(), d = Math.round(a - s); rm.className = 'remain ' + (d === 0 ? 'good' : 'bad');
     rm.innerHTML = `<span>總額 <b class="num">${fmt(a, F.currency)}</b>　已分配 <b class="num">${fmt(s, F.currency)}</b></span><span class="num">${d === 0 ? '✓ 剛好' : '剩餘 ' + fmt(d, F.currency)}</span>`; }
-  const rc = $('#rec');
-  if (rc) { const rk = rankCards(F.payer, F.cat, toTWD(a || 0, F.currency))[0];
-    rc.innerHTML = rk ? `建議刷 <b>${esc(rk.c.name)}</b>：${esc(F.cat)} ${rk.rate}%，額度剩 <span class="num">${fmt(rk.st.left, 'TWD')}</span>` : ''; rc.hidden = !rk; }
+  const rc = $('#rec'), amtT = toTWD(a || 0, F.currency);
+  if (rc) { const rk = rankCards([F.payer], Object.assign({}, F, { noBonus: false }), amtT, F.id)[0];
+    rc.innerHTML = rk ? `建議刷 <b>${esc(rk.c.name)}</b>：${rk.rule ? esc(rk.rule.name) + ' ' + rk.rule.rate + '%' : '基本 ' + rk.c.base + '%'}，扣手續費約 <b>${pct(rk.netRate)}</b>` : ''; rc.hidden = !rk; }
+  const cr = $('#cardRule'), card = F.cardId && D.cards.find(c => c.id === F.cardId);
+  if (cr && card) { const q = quote(card, F, amtT, F.id);
+    cr.innerHTML = F.noBonus ? `只算基本回饋 ${card.base}%` : q.rule ? `這筆適用：<b>${esc(q.rule.name)} ${q.rule.rate}%</b>${q.left !== Infinity ? `（加碼剩 ${fmt(q.left, 'TWD')}）` : ''}${q.rule.note ? `<br>⚠ ${esc(q.rule.note)}` : ''}`
+      : `這筆只有基本回饋 ${card.base}%${q.capped.length ? `（${esc(q.capped.join('、'))} 額度已滿）` : ''}。店名寫在「項目」或「備註」才會比對指定店家`; }
   const msg = check(); $('#hint').textContent = msg; $('#saveBtn').disabled = !!msg;
 }
 async function doSave() {
@@ -738,6 +787,7 @@ async function doSave() {
     id: F.id || newId(), date: F.date || today(), time: F.time || '', cat: F.cat, sub: F.sub, item: item, currency: F.currency,
     amount: F.amount === '' ? '' : num(F.amount), uncertain: F.uncertain || item === '待補' || F.cat === '未分類',
     payer: F.payer, pay: F.pay, cardId: F.pay === 'card' && canPickCard() ? F.cardId : (prev && !unlocked() ? prev.cardId : ''),
+    noBonus: F.pay === 'card' && canPickCard() ? !!(F.cardId && F.noBonus) : !!(prev && prev.noBonus),
     split: F.split, some: F.split === 'some' ? F.some.slice() : [], custom: {}, note: F.note.trim(), photoId: F.photoId || '', ocr: !!F.ocr,
     _pending: true, _err: '',
   });
@@ -757,7 +807,7 @@ function editRec(id) {
   const r = D.records[id]; if (!r) return;
   newForm({ id: r.id, date: r.date, time: r.time || '', cat: r.cat, sub: r.sub, item: r.item === '待補' ? '' : r.item, currency: r.currency, amount: r.amount === '' ? '' : String(r.amount),
     uncertain: r.uncertain, payer: r.payer, pay: r.pay, cardId: r.cardId || '', split: r.split, some: (r.some || []).slice(), custom: Object.assign({}, r.custom || {}),
-    customSel: Object.keys(r.custom || {}), note: r.note || '', photoId: r.photoId || '', ocr: r.ocr, baseRev: r.rev || null });
+    customSel: Object.keys(r.custom || {}), note: r.note || '', photoId: r.photoId || '', ocr: r.ocr, baseRev: r.rev || null, noBonus: !!r.noBonus });
 }
 
 /* ===== 照片與收據辨識 ===== */
@@ -818,36 +868,134 @@ $('#photoFile').addEventListener('change', async e => {
   try { F.photoData = await compress(f); renderForm(); } catch (err) { toast(err.message); }
 });
 
+/* ===== 建議卡片（2026 年 12 月日本） =====
+   rate＝含基本的總回饋%，cap＝加碼可刷的台幣上限（null＝無上限）。數字來自 2026/10 的公開整理，出發前要再核對 */
+const KUMAMON_SHOPS = ['Suica', 'PASMO', 'ICOCA', '西瓜卡', '交通卡儲值', 'JR', '新幹線', '日本航空', 'JAL', '租車', 'TOYOTA', 'Times租車', 'NIPPON租車', 'OTS租車', 'ORIX', 'Budget', '樂天旅遊', '東橫', '星野', '王子飯店', 'Prince',
+  'Bic', 'ビック', 'Yodobashi', '友都八喜', 'ヨドバシ', '松本清', 'マツモトキヨシ', '唐吉訶德', '驚安殿堂', 'Don Quijote', 'ドン・キホーテ', '大國藥妝', 'Daikoku', '無印良品', 'MUJI', '三井Outlet', 'LaLaport', 'UNIQLO', 'GU', 'Montbell', 'Alpen',
+  '一蘭', '松屋', 'SUKIYA', 'すき家', '壽司郎', 'スシロー', '藏壽司', 'くら寿司', '牛角', '鳥貴族', 'かつ榮', '敘敘苑', 'JOJOEN', '力丸', '六歌仙', 'Shake Shack', '羅多倫', 'DOUTOR', 'Fuglen', '今半',
+  '迪士尼', 'Disney', '哈利波特', '華納', 'Warner', '環球影城', 'USJ', '豪斯登堡', '樂高樂園', 'LEGOLAND', '三麗鷗', 'Puroland'];
+const JIHO_SHOPS = ['7-11', '7-Eleven', 'セブン', '全家', 'FamilyMart', 'ファミリーマート', 'Lawson', '羅森', 'ローソン', '迪士尼', 'Disney', '環球影城', 'USJ', 'AEON', '永旺', 'イオン', '三越', '高島屋',
+  'Bic', 'ビック', 'Yodobashi', '友都八喜', 'ヨドバシ', '唐吉訶德', '驚安殿堂', 'Don Quijote', 'ドン・キホーテ'];
+const SUICA = ['Suica', 'PASMO', 'ICOCA', '西瓜卡', '交通卡儲值'];
+const ALL = (name, rate, cap, note) => ({ name: name, kind: 'all', targets: [], rate: rate, cap: cap, note: note || '' });
+const SHOP = (name, targets, rate, cap, note) => ({ name: name, kind: 'store', targets: targets, rate: rate, cap: cap, note: note || '' });
+const PRESET = {
+  version: '2026/10 整理',
+  owners: [{ key: 'P', name: 'Peter' }, { key: 'W', name: '老婆' }],
+  cards: [
+    // ---- Peter ----
+    { owner: 'P', name: '中信 uniopen', base: 3, fee: 1.5, note: '限海外實體店，網購約 2%。8% 加碼可能需在 uniopen App 領券', rules: [ALL('海外實體加碼', 11, 6250, '每月上限 500 元；Apple Pay 儲值 Suica、網購可能不算實體')] },
+    { owner: 'P', name: '玉山 熊本熊', base: 2.5, fee: 1.5, note: '需登錄一次（7/1–12/31）。Agoda、Booking 訂房不算', rules: [SHOP('日本指定通路', KUMAMON_SHOPS, 8.5, 8333, '帳單店名要看得出是指定店家')] },
+    { owner: 'P', name: '富邦 J卡', base: 3, fee: 1.5, note: '需電子帳單或自扣。登錄：每月 18 日（Suica）／20 日（實體）16:00', rules: [SHOP('Suica 儲值（Apple Pay）', SUICA, 10, 2857, '單筆滿 NT$2,000、需登錄'), ALL('日本實體加碼', 6, 33333, '單筆滿 NT$1,000、需登錄（每季）')] },
+    { owner: 'P', name: '聯邦 吉鶴卡', base: 2.5, fee: 1.5, note: 'Apple Pay／Google Pay 加碼需登錄；Suica 儲值 1.5% 每月 15 日 10:00 登錄', rules: [SHOP('11 大指定通路＋Apple Pay', JIHO_SHOPS, 7, 20000, '7%＝2.5＋3＋1.5（用 Apple Pay）；實體卡 5.5%'), ALL('Apple／Google Pay 加碼', 4, 40000, '需綁 Apple Pay 或 Google Pay')] },
+    { owner: 'P', name: '永豐 幣倍卡', base: 2, fee: 1.5, note: '日圓帳戶自扣＋電子帳單；需前月資產月均 10 萬或大戶。日圓扣款的手續費待確認', rules: [ALL('海外加碼', 6, 20000, '每期加碼上限 800 元')] },
+    { owner: 'P', name: '星展 傳說對決', base: 1, fee: 1.5, note: '星展帳戶自動扣繳；限實體店（Apple Pay 可）', rules: [ALL('海外實體加碼', 5, 12500, '每月上限 500 元')] },
+    { owner: 'P', name: '星展 eco 永續卡', base: 1, fee: 1.5, note: '星展帳戶自動扣繳；限實體店', rules: [ALL('海外實體加碼', 5, 15000, '每期上限 600 元')] },
+    { owner: 'P', name: '富邦 好市多卡', base: 1, fee: 1.5, note: '每月 1 日 00:00 登錄（5 萬名）', rules: [ALL('海外實體加碼', 5, 15000, '需當月登錄')] },
+    { owner: 'P', name: '永豐 現金回饋 JCB', base: 2, fee: 1.5, note: '永豐自扣＋電子帳單。日韓泰季消費滿 2 萬登錄再 +5%（每季上限 1,000）', rules: [ALL('日本日幣消費', 5, 10000, '每期加碼上限 300 元')] },
+    { owner: 'P', name: '中信 LINE Pay 卡 JCB', base: 2.8, fee: 1.5, note: '回饋 LINE Points。Visa、JCB 兩張的加碼額度是否共用待確認', rules: [ALL('海外實體加碼（登錄）', 5, 20454, '每週二登錄 3,000 名')] },
+    { owner: 'P', name: '中信 LINE Pay 卡 Visa', base: 2.8, fee: 1.5, note: '回饋 LINE Points', rules: [ALL('海外實體加碼（登錄）', 5, 20454, '每週二登錄 3,000 名；可能與 JCB 卡共用額度')] },
+    { owner: 'P', name: '永豐 DAWHO', base: 2, fee: 1.5, note: '大戶等級', rules: [ALL('大戶海外加碼', 4.5, 16000, '每期加碼上限 400 元')] },
+    { owner: 'P', name: '永豐 DAWAY', base: 2.5, fee: 1.5, note: '回饋 LINE Points。千日慶需登錄、累積滿 3 萬才發', rules: [ALL('千日慶 +3%', 5.5, 33333, '10/1–12/31，需登錄')] },
+    { owner: 'P', name: '玉山 Unicard（UP選）', base: 1, fee: 1.5, note: '月底要是 UP選；未達免費條件扣 149 點', rules: [ALL('UP選 海外實體', 4.5, 142857, '日本實體在百大指定消費內')] },
+    { owner: 'P', name: '台新 Richart', base: 3.3, fee: 1.5, note: '要切換到「玩旅刷」', rules: [] },
+    { owner: 'P', name: '國泰 CUBE', base: 3, fee: 1.5, note: '切換「趣旅行」＋國泰帳戶自扣。12 月日本方案待公布', rules: [] },
+    { owner: 'P', name: '聯邦 賴點卡', base: 3, fee: 1.5, note: '需海外商店＋外幣交易', rules: [] },
+    { owner: 'P', name: '中信 華航 商務御璽', base: 3, fee: 1.5, note: '海外實體每 30 元 2 哩，以每哩約 0.45 元估算', rules: [] },
+    { owner: 'P', name: '玉山 世界卡', base: 1, fee: 1.5, note: '需登錄；當月國外實體滿 2 萬才加碼（非會員 2%、新富 2.2%、登峰 2.5%）', rules: [ALL('國外實體加碼', 2, null, '當月國外實體滿 2 萬')] },
+    // ---- 老婆 ----
+    { owner: 'W', name: '中信 uniopen', base: 3, fee: 1.5, note: '限海外實體店。8% 加碼可能需在 uniopen App 領券', rules: [ALL('海外實體加碼', 11, 6250, '每月上限 500 元；Apple Pay 儲值 Suica、網購可能不算實體')] },
+    { owner: 'W', name: '玉山 熊本熊', base: 2.5, fee: 1.5, note: '需登錄一次（7/1–12/31）', rules: [SHOP('日本指定通路', KUMAMON_SHOPS, 8.5, 8333, '帳單店名要看得出是指定店家')] },
+    { owner: 'W', name: '中信 LINE Pay 卡 JCB', base: 2.8, fee: 1.5, note: '回饋 LINE Points', rules: [ALL('海外實體加碼（登錄）', 5, 20454, '每週二登錄 3,000 名')] },
+    { owner: 'W', name: '中信 LINE Pay 卡 Visa', base: 2.8, fee: 1.5, note: '回饋 LINE Points', rules: [ALL('海外實體加碼（登錄）', 5, 20454, '可能與 JCB 卡共用額度')] },
+    { owner: 'W', name: '玉山 Unicard（UP選）', base: 1, fee: 1.5, note: '月底要是 UP選', rules: [ALL('UP選 海外實體', 4.5, 142857, '')] },
+    { owner: 'W', name: '中信 華航 商務御璽', base: 3, fee: 1.5, note: '海外實體每 30 元 2 哩（估算）', rules: [] },
+    { owner: 'W', name: '玉山 世界卡', base: 1, fee: 1.5, note: '需登錄；當月國外實體滿 2 萬才加碼', rules: [ALL('國外實體加碼', 2, null, '當月國外實體滿 2 萬')] },
+  ],
+};
+
 /* ===== 卡片表單（管理員） ===== */
 function cardForm(o) {
-  C = Object.assign({ id: '', owner: auth.me, name: '', rate: '', base: '', cap: '', cats: [], fee: '1.5', note: '', confirmDel: false, saving: false, err: '' }, o);
+  C = Object.assign({ mode: 'card', id: '', owner: auth.me, name: '', base: '', fee: '1.5', note: '', rules: [], confirmDel: false, saving: false, err: '' }, o);
+  C.rules = (C.rules || []).map(r => Object.assign({ name: '', kind: 'all', targets: [], rate: '', cap: '', note: '' }, r, { targets: (r.targets || []).slice(), rate: r.rate === '' || r.rate == null ? '' : String(r.rate), cap: r.cap == null ? '' : String(r.cap) }));
   $('#sheet').hidden = false; document.body.style.overflow = 'hidden'; renderCard(); $('#sheet').scrollTop = 0;
 }
 function renderCard() {
-  const owners = D.members.filter(m => m.admin), cats = D.categories.filter(c => c.cat !== '未分類'), all = C.cats.includes('*');
+  if (C.mode === 'import') return renderImport();
+  const owners = D.members.filter(m => m.admin), cats = D.categories.filter(c => c.cat !== '未分類');
   const f = (id, label, val, mode, ph) => `<div class="field"><label for="${id}" class="h" style="margin:0">${label}</label><input class="inp ${mode ? 'num' : ''}" id="${id}" ${mode ? `inputmode="${mode}"` : ''} placeholder="${ph || ''}" value="${esc(val)}"></div>`;
+  const rule = (r, i) => `<div class="panel" style="padding:10px;gap:8px;background:var(--surface-2)">
+    <div class="row2"><input class="inp" id="r${i}_name" placeholder="規則名稱，例如 指定通路" value="${esc(r.name)}"><button class="xbtn" style="flex:0 0 auto" data-act="r-del" data-v="${i}">刪除</button></div>
+    <div class="seg">${[['all', '全部消費'], ['cat', '指定類別'], ['store', '指定店家']].map(([k, l]) => `<button class="${r.kind === k ? 'on' : ''}" data-act="r-kind" data-v="${i}" data-k="${k}">${l}</button>`).join('')}</div>
+    ${r.kind === 'cat' ? `<div class="chips">${cats.map(c => `<button class="chip sm ${r.targets.includes(c.cat) ? 'on' : ''}" data-act="r-cat" data-v="${i}" data-k="${esc(c.cat)}">${c.icon} ${esc(c.cat)}</button>`).join('')}</div>` : ''}
+    ${r.kind === 'store' ? `<textarea class="inp" id="r${i}_targets" rows="3" placeholder="店家關鍵字，用頓號分隔，例如 唐吉訶德、Don Quijote、驚安殿堂">${esc(r.targets.join('、'))}</textarea>` : ''}
+    <div class="row2"><div class="field"><label class="note" for="r${i}_rate">總回饋 %（含基本）</label><input class="inp num" id="r${i}_rate" inputmode="decimal" value="${esc(r.rate)}"></div>
+    <div class="field"><label class="note" for="r${i}_cap">加碼上限（可刷台幣，空白＝無上限）</label><input class="inp num" id="r${i}_cap" inputmode="numeric" value="${esc(r.cap)}"></div></div>
+    <input class="inp" id="r${i}_note" placeholder="條件備註，例如 需登錄、單筆滿 1,000" value="${esc(r.note)}"></div>`;
   $('#sheet').innerHTML = `<div class="sh-in">
   <div class="sh-top"><button class="link" data-act="cancel">取消</button><h2>${C.id ? '編輯卡片' : '新增卡片'}</h2><span style="width:40px"></span></div>
-  ${f('cName', '卡片名稱', C.name, '', '例如：國泰 CUBE')}
+  ${f('cName', '卡片名稱', C.name, '', '例如：玉山 熊本熊')}
   <div class="field"><h3 class="h" style="margin:0">持卡人</h3><div class="chips">${owners.map(m => `<button class="chip ${C.owner === m.id ? 'on' : ''}" data-act="c-owner" data-v="${m.id}">${esc(m.name)}</button>`).join('')}</div></div>
-  <div class="row2">${f('cRate', '加碼回饋 %', C.rate, 'decimal', '5')}${f('cBase', '其他消費 %', C.base, 'decimal', '1')}</div>
-  <div class="field"><h3 class="h" style="margin:0">加碼類別</h3><div class="chips"><button class="chip sm ${all ? 'on' : ''}" data-act="c-cat" data-v="*">全部類別</button>${cats.map(c => `<button class="chip sm ${!all && C.cats.includes(c.cat) ? 'on' : ''}" data-act="c-cat" data-v="${esc(c.cat)}">${c.icon} ${esc(c.cat)}</button>`).join('')}</div></div>
-  <div class="row2">${f('cCap', '回饋上限（消費台幣）', C.cap, 'numeric', '30000')}${f('cFee', '海外手續費 %', C.fee, 'decimal', '1.5')}</div>
-  ${f('cNote', '備註（選填）', C.note, '', '例如：需登錄、每月重置')}
+  <div class="row2">${f('cBase', '基本回饋 %（無上限）', C.base, 'decimal', '2.5')}${f('cFee', '海外手續費 %', C.fee, 'decimal', '1.5')}</div>
+  <div class="field"><h3 class="h" style="margin:0">加碼規則</h3><div class="note">每筆消費會自動套用最划算、而且還有額度的規則；超過上限就回到基本回饋。店家是用「項目＋備註」裡的文字比對。</div>
+  ${C.rules.map(rule).join('')}<button class="btn ghost" data-act="r-add">＋ 新增加碼規則</button></div>
+  ${f('cNote', '卡片備註（選填）', C.note, '', '例如：需切換方案、帳戶自扣')}
   ${C.id ? (C.confirmDel ? `<div class="panel"><b>確定刪除這張卡？</b><div class="row2"><button class="btn danger" data-act="c-del-yes">刪除</button><button class="btn ghost" data-act="c-del-no">保留</button></div></div>`
     : '<button class="btn ghost" style="color:var(--seal)" data-act="c-del">刪除這張卡</button>') : ''}
   <div class="sh-foot"><div class="hint">${esc(C.err)}</div><button class="btn" data-act="c-save" ${C.saving ? 'disabled' : ''}>${C.saving ? '<span class="spin"></span> 儲存中' : '儲存卡片'}</button></div></div>`;
 }
-function readCardInputs() { ['name:cName', 'rate:cRate', 'base:cBase', 'cap:cCap', 'fee:cFee', 'note:cNote'].forEach(p => { const [k, id] = p.split(':'); const el = $('#' + id); if (el) C[k] = el.value; }); }
+function readCardInputs() {
+  if (C.mode !== 'card') return;
+  const v = id => { const el = $('#' + id); return el ? el.value : null; };
+  [['name', 'cName'], ['base', 'cBase'], ['fee', 'cFee'], ['note', 'cNote']].forEach(([k, id]) => { const x = v(id); if (x != null) C[k] = x; });
+  C.rules.forEach((r, i) => {
+    ['name', 'rate', 'cap', 'note'].forEach(k => { const x = v('r' + i + '_' + k); if (x != null) r[k] = x; });
+    const t = v('r' + i + '_targets'); if (t != null) r.targets = t.split(/[、,，\n]+/).map(s => s.trim()).filter(Boolean);
+  });
+}
+function cardPayload() {
+  return { id: C.id || undefined, owner: C.owner, name: C.name.trim(), base: num(C.base), fee: num(C.fee), note: C.note,
+    rules: C.rules.map(r => ({ name: r.name.trim() || '加碼', kind: r.kind, targets: r.kind === 'all' ? [] : r.targets, rate: num(r.rate), cap: String(r.cap).trim() === '' ? null : num(r.cap), note: r.note })) };
+}
 async function saveCardNow() {
   readCardInputs();
   if (!C.name.trim()) { C.err = '請輸入卡片名稱'; renderCard(); return; }
+  const bad = C.rules.findIndex(r => !(num(r.rate) > 0) || (r.kind !== 'all' && !r.targets.length));
+  if (bad >= 0) { C.err = `第 ${bad + 1} 條規則還沒填完整（回饋%，或類別／店家）`; renderCard(); return; }
   C.saving = true; C.err = ''; renderCard();
   try {
-    const j = await api('saveCard', { card: { id: C.id || undefined, owner: C.owner, name: C.name, rate: num(C.rate), base: C.base === '' ? num(C.rate) : num(C.base), cap: num(C.cap), cats: C.cats.length ? C.cats : ['*'], fee: num(C.fee), note: C.note } });
+    const j = await api('saveCard', { card: cardPayload() });
     const i = D.cards.findIndex(c => c.id === j.card.id); if (i >= 0) D.cards[i] = j.card; else D.cards.push(j.card);
     saveData(); closeSheet(); toast('卡片已儲存');
   } catch (e) { C.saving = false; C.err = e.code === 'NETWORK' ? '需要網路才能儲存卡片' : e.message; renderCard(); }
+}
+
+/* ===== 匯入建議卡片 ===== */
+function openImport() {
+  const admins = D.members.filter(m => m.admin);
+  const map = {}; PRESET.owners.forEach((o, i) => { const m = admins.find(a => a.name === o.name) || admins[i] || admins[0]; map[o.key] = m ? m.id : ''; });
+  const have = c => D.cards.some(x => x.owner === map[c.owner] && x.name === c.name);
+  C = { mode: 'import', map: map, pick: PRESET.cards.map(c => !have(c)), saving: false, err: '' };
+  $('#sheet').hidden = false; document.body.style.overflow = 'hidden'; renderImport(); $('#sheet').scrollTop = 0;
+}
+function renderImport() {
+  const admins = D.members.filter(m => m.admin);
+  const have = c => D.cards.some(x => x.owner === C.map[c.owner] && x.name === c.name);
+  $('#sheet').innerHTML = `<div class="sh-in">
+  <div class="sh-top"><button class="link" data-act="cancel">取消</button><h2>匯入建議卡片</h2><span style="width:40px"></span></div>
+  <div class="info">依 ${esc(PRESET.version)} 整理的日本回饋規則。匯入後可以在「卡片」頁逐張修改。已經有同名卡片的會自動跳過。</div>
+  ${PRESET.owners.map(o => `<div class="field"><h3 class="h" style="margin:0">「${esc(o.name)}」的卡要給</h3><div class="chips">${admins.map(m => `<button class="chip sm ${C.map[o.key] === m.id ? 'on' : ''}" data-act="imp-owner" data-v="${o.key}" data-k="${m.id}">${esc(m.name)}</button>`).join('')}</div></div>`).join('')}
+  ${PRESET.owners.map(o => `<section class="list">${PRESET.cards.map((c, i) => c.owner !== o.key ? '' : `<label class="row" style="grid-template-columns:28px minmax(0,1fr)"><input type="checkbox" id="imp${i}" ${C.pick[i] ? 'checked' : ''} ${have(c) ? 'disabled' : ''} style="width:20px;height:20px">
+    <span class="rmid"><span class="rt">${esc(c.name)}${have(c) ? '<em class="tag">已有</em>' : ''}</span><span class="rs">基本 ${c.base}%${c.rules.map(r => `・${esc(r.name)} ${r.rate}%`).join('')}</span></span></label>`).join('')}</section>`).join('')}
+  <div class="sh-foot"><div class="hint">${esc(C.err)}</div><button class="btn" data-act="imp-go" ${C.saving ? 'disabled' : ''}>${C.saving ? '<span class="spin"></span> 匯入中，約 20 秒' : '匯入勾選的卡片'}</button></div></div>`;
+}
+async function doImport() {
+  PRESET.cards.forEach((c, i) => { const el = $('#imp' + i); if (el) C.pick[i] = el.checked && !el.disabled; });
+  const cards = PRESET.cards.filter((c, i) => C.pick[i]).map((c, i) => Object.assign({}, c, { owner: C.map[c.owner], order: D.cards.length + i + 1 }));
+  if (!cards.length) { C.err = '沒有勾選卡片'; renderImport(); return; }
+  C.saving = true; C.err = ''; renderImport();
+  try { const j = await api('importCards', { cards: cards }, 120000); D.cards = D.cards.concat(j.cards); saveData(); closeSheet(); toast(`已匯入 ${j.cards.length} 張卡`); }
+  catch (e) { C.saving = false; C.err = e.code === 'NETWORK' ? '需要網路才能匯入' : e.message; renderImport(); }
 }
 
 /* ===== 事件 ===== */
@@ -887,12 +1035,19 @@ document.addEventListener('click', async e => {
     case 'del': F.confirmDel = true; renderForm(); break;
     case 'del-no': F.confirmDel = false; renderForm(); break;
     case 'del-yes': queueDelete(F.id); closeSheet(); toast('已刪除'); sync(); break;
-    case 'rc-cat': rcCat = v; document.querySelectorAll('#rcCats .chip').forEach(x => x.classList.toggle('on', x.dataset.v === v)); updRc(); break;
+    case 'shop-pick': shop.text = shop.text === v ? '' : v; render(); break;
+    case 'shop-cat': shop.cat = shop.cat === v ? '' : v; render(); break;
+    case 'shop-who': shop.who = v; render(); break;
+    case 'preset-open': openImport(); break;
+    case 'imp-owner': PRESET.cards.forEach((c, i) => { const el = $('#imp' + i); if (el) C.pick[i] = el.checked; }); C.map[v] = b.dataset.k; renderImport(); break;
+    case 'imp-go': doImport(); break;
     case 'card-new': cardForm({ owner: v }); break;
-    case 'card-edit': { const c = D.cards.find(x => x.id === v); if (c) cardForm({ id: c.id, owner: c.owner, name: c.name, rate: String(c.rate), base: String(c.base), cap: String(c.cap), cats: c.cats.slice(), fee: String(c.fee), note: c.note || '' }); break; }
+    case 'card-edit': { const c = D.cards.find(x => x.id === v); if (c) cardForm({ id: c.id, owner: c.owner, name: c.name, base: String(c.base), fee: String(c.fee), note: c.note || '', rules: c.rules || [] }); break; }
     case 'c-owner': readCardInputs(); C.owner = v; renderCard(); break;
-    case 'c-cat': readCardInputs(); if (v === '*') C.cats = C.cats.includes('*') ? [] : ['*'];
-      else { C.cats = C.cats.filter(x => x !== '*'); C.cats = C.cats.includes(v) ? C.cats.filter(x => x !== v) : C.cats.concat(v); } renderCard(); break;
+    case 'r-add': readCardInputs(); C.rules.push({ name: '', kind: 'store', targets: [], rate: '', cap: '', note: '' }); renderCard(); break;
+    case 'r-del': readCardInputs(); C.rules.splice(+v, 1); renderCard(); break;
+    case 'r-kind': readCardInputs(); C.rules[+v].kind = b.dataset.k; if (b.dataset.k !== 'store') C.rules[+v].targets = C.rules[+v].targets.filter(t => D.categories.some(c => c.cat === t)); renderCard(); break;
+    case 'r-cat': { readCardInputs(); const r = C.rules[+v], k = b.dataset.k; r.targets = r.targets.includes(k) ? r.targets.filter(x => x !== k) : r.targets.concat(k); renderCard(); break; }
     case 'c-save': saveCardNow(); break;
     case 'c-del': readCardInputs(); C.confirmDel = true; renderCard(); break;
     case 'c-del-no': C.confirmDel = false; renderCard(); break;
@@ -939,11 +1094,14 @@ document.addEventListener('input', e => {
     else if (t.id === 'date') F.date = t.value;
     else if (t.dataset.cu) { const c = t.value.replace(/[^\d.]/g, ''); if (c !== t.value) t.value = c; F.custom[t.dataset.cu] = c; updLive(); }
   }
-  if (t.id === 'rcAmt') updRc();
+  if (t.id === 'shopText') { shop.text = t.value; updShop(); }
+  if (t.id === 'shopAmt') { shop.amt = t.value.replace(/[^\d.]/g, ''); updShop(); }
+  if (F && (t.id === 'item' || t.id === 'note')) updLive();
 });
 document.addEventListener('change', e => {
   const t = e.target;
   if (!F) return;
+  if (t.id === 'noBonus') { F.noBonus = t.checked; $('#noBonusL').classList.toggle('on', t.checked); updLive(); }
   if (t.id === 'unc') { F.uncertain = t.checked; $('#uncL').classList.toggle('on', t.checked); updLive(); }
   if (t.id === 'hh' || t.id === 'mm') F.time = $('#hh').value + ':' + $('#mm').value;
   if (t.id === 'noTime') { F.time = t.checked ? '' : nowHM(); const y = $('#sheet').scrollTop; renderForm(); $('#sheet').scrollTop = y; }
@@ -961,7 +1119,7 @@ setInterval(() => { if (document.visibilityState === 'visible' && !F && !C) sync
 
 /* ===== 啟動 ===== */
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
-if (auth && D) { render(); sync(); }
+if (auth && D) { render(); sync(true); }   // 每次打開 App 都完整載入一次，Sheet 上改的類別、模板、清空的資料才會套用
 else if (auth) { $('#login').hidden = false; $('#login').innerHTML = '<div class="login-in"><div class="brand">旅途記帳本</div><div class="note"><span class="spin"></span> 載入中…</div></div>';
   sync(true).then(() => { if (D) { $('#login').hidden = true; render(); } else if (auth) { $('#login').innerHTML = '<div class="login-in"><div class="brand">旅途記帳本</div><div class="alert">第一次開啟需要網路，請連上網路後重新整理</div></div>'; } }); }
 else showLogin();
